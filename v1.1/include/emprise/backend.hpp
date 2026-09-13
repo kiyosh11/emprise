@@ -52,6 +52,20 @@ public:
     virtual void recurrent_block(Gguf& model, const RecurrentBlock& params);
     // Clears any backend-owned recurrent state (called on model reset).
     virtual void reset_state() {}
+    // Optional device-resident path: the CUDA backend overrides these so the
+    // residual stream can stay on the GPU for a whole token. The model only
+    // calls them when device_path() is true.
+    virtual bool device_path() const { return false; }
+    virtual uint64_t device_capacity() const { return 0; }
+    virtual uint64_t dev_alloc(size_t bytes) { (void)bytes; return 0; }
+    virtual void dev_free(uint64_t) {}
+    virtual void dev_upload(uint64_t, const void*, size_t) {}
+    virtual void dev_download(void*, uint64_t, size_t) {}
+    virtual void dev_rmsnorm(Gguf&, uint64_t, const Tensor&, uint64_t, int, float) {}
+    virtual void dev_add(uint64_t, uint64_t, int) {}
+    virtual void dev_linear(Gguf&, const Tensor&, uint64_t, uint64_t) {}
+    virtual void dev_ffn(Gguf&, const Tensor&, const Tensor&, const Tensor&, uint64_t, uint64_t) {}
+    virtual void dev_recurrent(Gguf&, const RecurrentBlock&, uint64_t, uint64_t) {}
 };
 std::unique_ptr<Backend> cpu_backend();
 // Throws a diagnostic if CUDA/NVRTC is unavailable. A zero budget uses current

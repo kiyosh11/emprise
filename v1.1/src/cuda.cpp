@@ -530,6 +530,20 @@ extern "C" __global__ void linear_q4_f32_x4(const unsigned char* __restrict__ w,
     }
     if(!lane){ y[row]=pr[0][0]; if(avail>1)y[row+1]=pr[1][0]; if(avail>2)y[row+2]=pr[2][0]; if(avail>3)y[row+3]=pr[3][0]; }
 }
+extern "C" __global__ void rmsnorm_kernel(const float* __restrict__ x,const float* __restrict__ w,float* __restrict__ out,int n,float eps){
+    __shared__ float red[256];
+    int t=threadIdx.x;
+    float s=0;
+    for(int i=t;i<n;i+=blockDim.x) s+=x[i]*x[i];
+    red[t]=s; __syncthreads();
+    for(int st=blockDim.x>>1;st;st>>=1){ if(t<st) red[t]+=red[t+st]; __syncthreads(); }
+    float scale=rsqrtf(red[0]/(float)n+eps);
+    for(int i=t;i<n;i+=blockDim.x) out[i]=x[i]*scale*w[i];
+}
+extern "C" __global__ void add_inplace(float* __restrict__ x,const float* __restrict__ y,int n){
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n) x[i]+=y[i];
+}
 extern "C" __global__ void quantize_x(const float* x, signed char* q, float* scales, int cols) {
     int lane=threadIdx.x, i=blockIdx.x*32+lane;
     float v=i<cols?x[i]:0.0f, a=fabsf(v);
@@ -598,6 +612,7 @@ class Cuda final: public Backend {
     int (*launch)(void*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void*, void**, void**) = driver.symbol<decltype(launch)>("cuLaunchKernel");
     void *context = nullptr, *module = nullptr, *kernel = nullptr, *q8_kernel = nullptr, *q6_f32_kernel = nullptr, *q6_f32_x2_kernel = nullptr, *q6_f32_x4_kernel = nullptr, *q6_f32_x8_kernel = nullptr, *q6_f32_batch_kernel = nullptr, *q4_f32_x4_kernel = nullptr, *fused_proj_kernel = nullptr, *quantize_kernel = nullptr, *swiglu_kernel = nullptr;
     void *delta_conv_kernel = nullptr, *delta_qk_kernel = nullptr, *delta_scan_kernel = nullptr, *delta_norm_kernel = nullptr;
+    void *rmsnorm_kernel = nullptr, *add_kernel = nullptr;
     Ptr dn_scratch = 0; size_t dn_scratch_size = 0;
     Ptr rb_proj = 0; size_t rb_proj_size = 0;
     Ptr rb_dn = 0; size_t rb_dn_size = 0;
@@ -759,6 +774,8 @@ public:
             check(driver.symbol<int(*)(void**, void*, const char*)>("cuModuleGetFunction")(&delta_qk_kernel, module, "delta_qk_scale"), "get delta qk kernel");
             check(driver.symbol<int(*)(void**, void*, const char*)>("cuModuleGetFunction")(&delta_scan_kernel, module, "delta_scan"), "get delta scan kernel");
             check(driver.symbol<int(*)(void**, void*, const char*)>("cuModuleGetFunction")(&delta_norm_kernel, module, "delta_norm_gate"), "get delta norm kernel");
+            check(driver.symbol<int(*)(void**, void*, const char*)>("cuModuleGetFunction")(&rmsnorm_kernel, module, "rmsnorm_kernel"), "get rmsnorm kernel");
+            check(driver.symbol<int(*)(void**, void*, const char*)>("cuModuleGetFunction")(&add_kernel, module, "add_inplace"), "get add kernel");
             if (verbose) {
                 auto getattr = driver.symbol<int(*)(int*, int, void*)>("cuFuncGetAttribute");
                 for (auto [name, fn] : {std::pair<const char*, void*>("linear", kernel),
@@ -1022,6 +1039,91 @@ public:
         buffer(output,output_size,p.out.size_bytes());
         device_linear(*p.out_w,wo,rb_dn,output);
         check(dtoh(p.out.data(),output,p.out.size_bytes()),"read recurrent output");
+    }
+    // --- device-resident path: activations live in VRAM, no per-layer transfers ---
+    bool device_path() const override { return true; }
+    uint64_t device_capacity() const override { return budget; }
+    uint64_t dev_alloc(size_t bytes) override { Ptr p=0; check(alloc(&p,bytes),"device alloc"); return p; }
+    void dev_free(uint64_t p) override { if(p) free_mem(p); }
+    void dev_upload(uint64_t dst,const void* src,size_t bytes) override { check(set_context(context),"set context"); check(htod(dst,src,bytes),"device upload"); }
+    void dev_download(void* dst,uint64_t src,size_t bytes) override { check(set_context(context),"set context"); check(dtoh(dst,src,bytes),"device download"); }
+    void dev_rmsnorm(Gguf& model,uint64_t x,const Tensor& w,uint64_t out,int n,float eps) override {
+        bind(model);
+        Ptr wp=resident(model,w);
+        if(!wp) throw std::runtime_error("device path requires resident weights");
+        void* args[]={&x,&wp,&out,&n,&eps};
+        check(launch(rmsnorm_kernel,1,1,1,256,1,1,0,nullptr,args,nullptr),"launch rmsnorm");
+    }
+    void dev_add(uint64_t x,uint64_t y,int n) override {
+        check(set_context(context),"set context");
+        void* args[]={&x,&y,&n};
+        check(launch(add_kernel,(n+255)/256,1,1,256,1,1,0,nullptr,args,nullptr),"launch add");
+    }
+    void dev_linear(Gguf& model,const Tensor& t,uint64_t x,uint64_t y) override {
+        bind(model);
+        Ptr w=resident(model,t);
+        if(!w) throw std::runtime_error("device path requires resident weights");
+        device_linear(t,w,x,y);
+    }
+    void dev_ffn(Gguf& model,const Tensor& gate,const Tensor& up,const Tensor& down,uint64_t x,uint64_t y) override {
+        bind(model);
+        Ptr gw=resident(model,gate),uw=resident(model,up),dw=resident(model,down);
+        if(!gw||!uw||!dw) throw std::runtime_error("device path requires resident weights");
+        int n=static_cast<int>(gate.shape[1]);
+        buffer(gate_buffer,gate_size,size_t(n)*sizeof(float));
+        buffer(up_buffer,up_size,size_t(n)*sizeof(float));
+        device_linear(gate,gw,x,gate_buffer);
+        device_linear(up,uw,x,up_buffer);
+        void* args[]={&gate_buffer,&up_buffer,&n};
+        check(launch(swiglu_kernel,(n+127)/128,1,1,128,1,1,0,nullptr,args,nullptr),"launch swiglu");
+        device_linear(down,dw,gate_buffer,y);
+    }
+    void dev_recurrent(Gguf& model,const Backend::RecurrentBlock& p,uint64_t x,uint64_t y) override {
+        const int key_dim=p.key_heads*p.state_dim, value_dim=p.value_heads*p.state_dim, channels=2*key_dim+value_dim;
+        bind(model);
+        Ptr wq=resident(model,*p.qkv_w),wg=resident(model,*p.gate_w),wa=resident(model,*p.alpha_w),
+            wb=resident(model,*p.beta_w),wo=resident(model,*p.out_w);
+        if(!wq||!wg||!wa||!wb||!wo) throw std::runtime_error("device path requires resident weights");
+        auto& slot=dn_slots[p.slot];
+        if(!slot.conv) {
+            check(alloc(&slot.conv,size_t(channels)*p.conv_width*sizeof(float)),"allocate delta conv state");
+            check(alloc(&slot.rec,size_t(value_dim)*p.state_dim*sizeof(float)),"allocate delta rec state");
+            std::vector<float> zeros(static_cast<size_t>(std::max(size_t(channels)*p.conv_width,size_t(value_dim)*p.state_dim)),0.f);
+            check(htod(slot.conv,zeros.data(),size_t(channels)*p.conv_width*sizeof(float)),"zero delta conv state");
+            check(htod(slot.rec,zeros.data(),size_t(value_dim)*p.state_dim*sizeof(float)),"zero delta rec state");
+        }
+        Ptr conv_state=slot.conv, rec_state=slot.rec;
+        const size_t proj_total=size_t(channels)+size_t(value_dim)+2*size_t(p.value_heads);
+        buffer(rb_proj,rb_proj_size,proj_total*sizeof(float));
+        Ptr qkv_p=rb_proj, gate_p=rb_proj+size_t(channels)*sizeof(float);
+        Ptr alpha_p=gate_p+size_t(value_dim)*sizeof(float), beta_p=alpha_p+size_t(p.value_heads)*sizeof(float);
+        device_linear(*p.qkv_w,wq,x,qkv_p);
+        device_linear(*p.gate_w,wg,x,gate_p);
+        device_linear(*p.alpha_w,wa,x,alpha_p);
+        device_linear(*p.beta_w,wb,x,beta_p);
+        const size_t conv_n=size_t(channels)*p.conv_width, ab_n=size_t(p.value_heads), norm_n=size_t(p.state_dim);
+        if(!slot.params) {
+            slot.params_n=conv_n+3*ab_n+norm_n;
+            check(alloc(&slot.params,slot.params_n*sizeof(float)),"allocate recurrent params");
+            std::vector<float> packed(slot.params_n);
+            std::copy(p.conv.begin(),p.conv.end(),packed.begin());
+            std::copy(p.ssm_a.begin(),p.ssm_a.end(),packed.begin()+conv_n);
+            std::copy(p.dt.begin(),p.dt.end(),packed.begin()+conv_n+ab_n);
+            std::copy(p.norm.begin(),p.norm.end(),packed.begin()+conv_n+2*ab_n);
+            check(htod(slot.params,packed.data(),slot.params_n*sizeof(float)),"upload recurrent params");
+        }
+        Ptr convw_p=slot.params, a_p=slot.params+conv_n*sizeof(float);
+        Ptr dt_p=a_p+ab_n*sizeof(float), norm_p=dt_p+ab_n*sizeof(float);
+        buffer(rb_dn,rb_dn_size,size_t(value_dim)*sizeof(float));
+        int c=channels, cw=p.conv_width, sd=p.state_dim, kh=p.key_heads, vh=p.value_heads, kd=key_dim;
+        float eps=p.eps;
+        { void* args[]={&qkv_p,&convw_p,&conv_state,&c,&cw};
+          check(launch(delta_conv_kernel,(channels+255)/256,1,1,256,1,1,0,nullptr,args,nullptr),"launch delta conv"); }
+        { void* args[]={&qkv_p,&alpha_p,&beta_p,&a_p,&dt_p,&rec_state,&rb_dn,&kd,&sd,&kh,&vh,&eps};
+          check(launch(delta_scan_kernel,(vh*sd+7)/8,1,1,256,1,1,0,nullptr,args,nullptr),"launch delta scan"); }
+        { void* args[]={&rb_dn,&gate_p,&norm_p,&eps,&sd};
+          check(launch(delta_norm_kernel,vh,1,1,128,1,1,0,nullptr,args,nullptr),"launch delta norm"); }
+        device_linear(*p.out_w,wo,rb_dn,y);
     }
 };
 }

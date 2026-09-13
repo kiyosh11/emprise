@@ -41,6 +41,8 @@ struct Model::Impl {
     Vec hidden_out;         // output-normalized hidden of the last evaluated position
     Vec hidden_raw_out;     // raw (pre-output-norm) hidden of the last evaluated position
     Vec mtp_hidden;         // hidden produced by the last mtp_step (for chaining)
+    // device-resident buffers (only when the backend supports the device path)
+    uint64_t dev_x=0,dev_norm=0,dev_tmp=0,dev_attn=0,dev_qkv=0,dev_logits=0;
 
     Impl(const std::filesystem::path& path, ModelOptions opts): weights(path), tok(weights.metadata_json()), options(opts) {
 #ifdef _OPENMP
@@ -124,7 +126,7 @@ struct Model::Impl {
         }
     }
     void rope(std::span<float> x) { rope(x, static_cast<int>(position)); }
-    Vec attention_from_qkv(const std::string& p, Vec qg, Vec k, Vec v, LayerState& st, int pos) {
+    Vec attention_preout(const std::string& p, Vec qg, Vec k, Vec v, LayerState& st, int pos) {
         if (qg.size()!=size_t(heads*head_dim*2) || k.size()!=size_t(kv_heads*head_dim) || v.size()!=k.size())
             throw std::runtime_error("Attention projection dimensions");
         auto& qn=parameter(p+"attn_q_norm.weight"); auto& kn=parameter(p+"attn_k_norm.weight");
@@ -151,7 +153,10 @@ struct Model::Impl {
                 out[h*head_dim+d]=sum*sigmoid(qg[h*head_dim*2+head_dim+d]);
             }
         }
-        return mm(p+"attn_output.weight",out);
+        return out;
+    }
+    Vec attention_from_qkv(const std::string& p, Vec qg, Vec k, Vec v, LayerState& st, int pos) {
+        return mm(p+"attn_output.weight",attention_preout(p,std::move(qg),std::move(k),std::move(v),st,pos));
     }
     Vec attention(const std::string& p, const Vec& x, LayerState& st) {
         auto projections=mms({p+"attn_q.weight",p+"attn_k.weight",p+"attn_v.weight"},x);
@@ -390,6 +395,81 @@ struct Model::Impl {
         Vec head_n=norm(std::move(cur),"blk.32.nextn.shared_head_norm.weight");
         return mm("output.weight",head_n);
     }
+    bool use_device() const {
+        if(!backend->device_path()) return false;
+        uint64_t need=0;
+        for(const auto& t:weights.tensors()) {
+            if(t.name.rfind("blk.32.",0)==0) continue;
+            need += (t.type==WeightType::q6_k)? (t.elements/256)*216 : (t.type==WeightType::q4_k)? (t.elements/256)*160 : t.bytes;
+        }
+        return need + 256ull*1024*1024 <= backend->device_capacity();
+    }
+    void ensure_dev() {
+        if(dev_x) return;
+        dev_x=backend->dev_alloc(static_cast<size_t>(hidden)*sizeof(float));
+        dev_norm=backend->dev_alloc(static_cast<size_t>(hidden)*sizeof(float));
+        dev_tmp=backend->dev_alloc(static_cast<size_t>(hidden)*sizeof(float));
+        dev_attn=backend->dev_alloc(static_cast<size_t>(heads*head_dim)*sizeof(float));
+        dev_qkv=backend->dev_alloc(static_cast<size_t>(heads*head_dim*2+2*kv_heads*head_dim)*sizeof(float));
+    }
+    ~Impl() {
+        if(backend) {
+            for(uint64_t p:{dev_x,dev_norm,dev_tmp,dev_attn,dev_qkv,dev_logits}) backend->dev_free(p);
+        }
+    }
+    // Full token forward with the residual stream kept in VRAM. Only the
+    // attention hop (q/k/v down, attention output up) touches the host.
+    Vec evaluate_device(int token,bool want_logits) {
+        if(position>=options.context) throw std::runtime_error("Context budget exhausted");
+        ensure_dev();
+        Vec x=embed(token);
+        backend->dev_upload(dev_x,x.data(),x.size()*sizeof(float));
+        for(int layer=0;layer<layers;++layer) {
+            const auto p="blk."+std::to_string(layer)+".";
+            backend->dev_rmsnorm(weights,dev_x,weights.tensor(p+"attn_norm.weight"),dev_norm,hidden,eps);
+            if(linear_layers[layer]) {
+                Backend::RecurrentBlock b;
+                b.qkv_w=&weights.tensor(p+"attn_qkv.weight"); b.gate_w=&weights.tensor(p+"attn_gate.weight");
+                b.alpha_w=&weights.tensor(p+"ssm_alpha.weight"); b.beta_w=&weights.tensor(p+"ssm_beta.weight");
+                b.out_w=&weights.tensor(p+"ssm_out.weight");
+                b.conv=parameter(p+"ssm_conv1d.weight"); b.ssm_a=parameter(p+"ssm_a");
+                b.dt=parameter(p+"ssm_dt.bias"); b.norm=parameter(p+"ssm_norm.weight");
+                b.key_heads=key_heads; b.value_heads=value_heads; b.state_dim=state_dim; b.conv_width=conv_width;
+                b.eps=eps; b.slot=layer;
+                backend->dev_recurrent(weights,b,dev_norm,dev_tmp);
+            } else {
+                const int qd=heads*head_dim*2, kd=kv_heads*head_dim;
+                backend->dev_linear(weights,weights.tensor(p+"attn_q.weight"),dev_norm,dev_qkv);
+                backend->dev_linear(weights,weights.tensor(p+"attn_k.weight"),dev_norm,dev_qkv+static_cast<uint64_t>(qd)*sizeof(float));
+                backend->dev_linear(weights,weights.tensor(p+"attn_v.weight"),dev_norm,dev_qkv+static_cast<uint64_t>(qd+kd)*sizeof(float));
+                Vec qkv(static_cast<size_t>(qd+2*kd));
+                backend->dev_download(qkv.data(),dev_qkv,qkv.size()*sizeof(float));
+                Vec qg(qkv.begin(),qkv.begin()+qd);
+                Vec kx(qkv.begin()+qd,qkv.begin()+qd+kd);
+                Vec vx(qkv.begin()+qd+kd,qkv.end());
+                Vec attn=attention_preout(p,std::move(qg),std::move(kx),std::move(vx),states[layer],static_cast<int>(position));
+                backend->dev_upload(dev_attn,attn.data(),attn.size()*sizeof(float));
+                backend->dev_linear(weights,weights.tensor(p+"attn_output.weight"),dev_attn,dev_tmp);
+            }
+            backend->dev_add(dev_x,dev_tmp,hidden);
+            backend->dev_rmsnorm(weights,dev_x,weights.tensor(p+"post_attention_norm.weight"),dev_norm,hidden,eps);
+            backend->dev_ffn(weights,weights.tensor(p+"ffn_gate.weight"),weights.tensor(p+"ffn_up.weight"),weights.tensor(p+"ffn_down.weight"),dev_norm,dev_tmp);
+            backend->dev_add(dev_x,dev_tmp,hidden);
+        }
+        Vec result;
+        if(want_logits) {
+            backend->dev_rmsnorm(weights,dev_x,weights.tensor("output_norm.weight"),dev_norm,hidden,eps);
+            const auto& ow=weights.tensor("output.weight");
+            const int vocab=static_cast<int>(ow.shape[1]);
+            if(!dev_logits) dev_logits=backend->dev_alloc(static_cast<size_t>(vocab)*sizeof(float));
+            backend->dev_linear(weights,ow,dev_norm,dev_logits);
+            result.resize(static_cast<size_t>(vocab));
+            backend->dev_download(result.data(),dev_logits,result.size()*sizeof(float));
+        }
+        ++position;
+        ++profile.evaluated_tokens;
+        return result;
+    }
 };
 Model::Model(const std::filesystem::path& p, ModelOptions o):impl_(std::make_unique<Impl>(p,o)) {}
 Model::~Model()=default;
@@ -412,12 +492,13 @@ void Model::generate(const std::vector<int>& prompt,size_t count,const std::func
     reset();
     if(!count) return;
     if(cancelled && cancelled->load()) return;
+    const bool dev=impl_->use_device();
     Vec logits=impl_->prefill(prompt);
     for(size_t i=0;i<count;++i) {
         if(cancelled && cancelled->load()) return;
         int token=static_cast<int>(std::max_element(logits.begin(),logits.end())-logits.begin());
         if(token==impl_->eos || !output(token)) return;
-        if(i+1<count) logits=evaluate(token);
+        if(i+1<count) logits = dev? impl_->evaluate_device(token,true) : impl_->evaluate(token,true);
     }
 }
 }
