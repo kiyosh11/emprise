@@ -481,30 +481,27 @@ extern "C" __global__ void delta_norm_gate(float* out,const float* gate,const fl
 // Q4_K decode for one group of eight weights in a row. The group shares a scale
 // and a min, so the contribution is d1*sum(q*x) - m1*sum(x); the caller passes
 // sum(x) once and reuses it across rows.
-__device__ __forceinline__ float q4_row(const unsigned char* __restrict__ b,int qoff,int is,int half,const float4& xa,const float4& xb,float sx){
-    const unsigned char* sc=b+4;
-    int cc,mn;
-    if(is<4){ cc=sc[is]&63; mn=sc[is+4]&63; }
-    else { cc=(sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mn=(sc[is+4]>>4)|((sc[is]>>6)<<4); }
-    const unsigned* qs=(const unsigned*)(b+qoff);
-    unsigned w0=qs[0],w1=qs[1];
-    unsigned n0=half?((w0>>4)&0x0F0F0F0F):(w0&0x0F0F0F0F);
-    unsigned n1=half?((w1>>4)&0x0F0F0F0F):(w1&0x0F0F0F0F);
+__device__ __forceinline__ float q4_row(const unsigned char* __restrict__ b,int qoff,int is,const float4& xa,const float4& xb,float sx){
+    const int cc=b[4+is], mn=b[12+is];
+    const uint2 qs=*(const uint2*)(b+qoff);
+    const unsigned w0=qs.x,w1=qs.y;
+    const unsigned n0=(is&1)?((w0>>4)&0x0F0F0F0F):(w0&0x0F0F0F0F);
+    const unsigned n1=(is&1)?((w1>>4)&0x0F0F0F0F):(w1&0x0F0F0F0F);
     float dq=0;
     dq+=(float)(n0&0xff)*xa.x; dq+=(float)((n0>>8)&0xff)*xa.y;
     dq+=(float)((n0>>16)&0xff)*xa.z; dq+=(float)((n0>>24)&0xff)*xa.w;
     dq+=(float)(n1&0xff)*xb.x; dq+=(float)((n1>>8)&0xff)*xb.y;
     dq+=(float)((n1>>16)&0xff)*xb.z; dq+=(float)((n1>>24)&0xff)*xb.w;
-    float d1=half_to_float_fast(*(const unsigned short*)(b+0))*cc;
-    float m1=half_to_float_fast(*(const unsigned short*)(b+2))*mn;
-    return d1*dq - m1*sx;
+    const float d=half_to_float_fast(*(const unsigned short*)(b+0));
+    const float dmin=half_to_float_fast(*(const unsigned short*)(b+2));
+    return d*cc*dq - dmin*mn*sx;
 }
 extern "C" __global__ void linear_q4_f32_x4(const unsigned char* __restrict__ w,const float* __restrict__ x,float* __restrict__ y,int cols,int rows){
     int row=blockIdx.x*4,lane=threadIdx.x;
     if(row>=rows) return;
     int i0=(lane*8)&255, j=i0>>6, half=(i0>>5)&1, l=i0&31;
-    int qoff=16+j*32+l, is=j*2+half;
-    const unsigned long long rs=(cols>>8)*144ull;
+    int qoff=24+j*32+l, is=j*2+half;
+    const unsigned long long rs=(cols>>8)*160ull;
     const int nblocks=cols>>8, step=(blockDim.x*8)>>8;
     int block=(lane*8)>>8;
     const float* xp=x+lane*8;
@@ -513,11 +510,11 @@ extern "C" __global__ void linear_q4_f32_x4(const unsigned char* __restrict__ w,
     for(;block<nblocks;block+=step,xp+=blockDim.x*8){
         const float4 xa=*(const float4*)xp, xb=*(const float4*)(xp+4);
         float sx=xa.x+xa.y+xa.z+xa.w+xb.x+xb.y+xb.z+xb.w;
-        const unsigned char* base=w+rs*row+(unsigned long long)block*144ull;
-        s0+=q4_row(base,qoff,is,half,xa,xb,sx);
-        if(avail>1) s1+=q4_row(base+rs,qoff,is,half,xa,xb,sx);
-        if(avail>2) s2+=q4_row(base+2*rs,qoff,is,half,xa,xb,sx);
-        if(avail>3) s3+=q4_row(base+3*rs,qoff,is,half,xa,xb,sx);
+        const unsigned char* base=w+rs*row+(unsigned long long)block*160ull;
+        s0+=q4_row(base,qoff,is,xa,xb,sx);
+        if(avail>1) s1+=q4_row(base+rs,qoff,is,xa,xb,sx);
+        if(avail>2) s2+=q4_row(base+2*rs,qoff,is,xa,xb,sx);
+        if(avail>3) s3+=q4_row(base+3*rs,qoff,is,xa,xb,sx);
     }
     __shared__ float pr[4][128];
     pr[0][lane]=s0; if(avail>1)pr[1][lane]=s1; if(avail>2)pr[2][lane]=s2; if(avail>3)pr[3][lane]=s3;
@@ -628,7 +625,9 @@ class Cuda final: public Backend {
     // Q6_K super-blocks are padded from 210 to 216 bytes in VRAM so that every
     // block and every four-weight offset stays 4-byte aligned for word loads.
     static uint64_t vram_bytes(const Tensor& t) {
-        return t.type==WeightType::q6_k ? (t.elements/256)*216 : t.bytes;
+        if (t.type == WeightType::q6_k) return (t.elements/256)*216;
+        if (t.type == WeightType::q4_k) return (t.elements/256)*160;
+        return t.bytes;
     }
     Ptr resident(Gguf& model, const Tensor& t) {
         auto found=weights.find(t.name);
@@ -649,6 +648,30 @@ class Cuda final: public Backend {
                         for(int z=210;z<216;++z) out[i*216+z]=std::byte{0};
                     }
                     check(htod(ptr+done*216,out.data(),static_cast<size_t>(n*216)),"upload weights");
+                }
+            } else if(t.type==WeightType::q4_k) {
+                // Repack 144-byte Q4_K blocks to 160 bytes with the 6-bit scales
+                // and mins decoded to plain bytes, so the hot loop has no bit math.
+                const uint64_t blocks=t.elements/256;
+                const uint64_t per_tile=std::max<uint64_t>(1,(4*1024*1024)/144);
+                std::vector<std::byte> in(static_cast<size_t>(per_tile*144)), out(static_cast<size_t>(per_tile*160));
+                for(uint64_t done=0;done<blocks;done+=per_tile) {
+                    const uint64_t n=std::min(per_tile,blocks-done);
+                    model.read(t,done*144,std::span(in).first(static_cast<size_t>(n*144)));
+                    for(uint64_t i=0;i<n;++i) {
+                        const std::byte* src=in.data()+i*144; std::byte* dst=out.data()+i*160;
+                        std::memcpy(dst,src,4); // super-scale and super-min (fp16 each)
+                        const auto* sc=reinterpret_cast<const uint8_t*>(src)+4;
+                        for(int jj=0;jj<8;++jj) {
+                            uint8_t s,mn;
+                            if(jj<4){ s=sc[jj]&63; mn=sc[jj+4]&63; }
+                            else { s=(sc[jj+4]&0xF)|((sc[jj-4]>>6)<<4); mn=(sc[jj+4]>>4)|((sc[jj]>>6)<<4); }
+                            dst[4+jj]=std::byte{s}; dst[12+jj]=std::byte{mn};
+                        }
+                        std::memcpy(dst+24,src+16,128);
+                        for(int z=152;z<160;++z) dst[z]=std::byte{0};
+                    }
+                    check(htod(ptr+done*160,out.data(),static_cast<size_t>(n*160)),"upload weights");
                 }
             } else {
                 std::vector<std::byte> tile(static_cast<size_t>(std::min<uint64_t>(t.bytes,8*1024*1024)));

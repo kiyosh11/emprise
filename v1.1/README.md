@@ -37,17 +37,20 @@ exact FP32 activations:
 
 ```mermaid
 xychart-beta
-    title "9B Q6_K, Quadro P4000 (output tokens/sec)"
-    x-axis ["Emprise", "llama.cpp"]
+    title "9B on Quadro P4000 (output tokens/sec)"
+    x-axis ["Emprise Q4_K", "Emprise Q6_K", "llama.cpp Q6_K"]
     y-axis "tokens/sec" 0 --> 20
-    bar [18.5, 17.7]
+    bar [19.5, 18.5, 17.7]
 ```
 
 | Model | Hardware | Backend | Speed |
 |---|---|---:|---:|
+| 9B Q4_K_M | Quadro P4000, 16 CPU threads | CUDA | ~19.5 tok/s |
 | 9B Q6_K | Quadro P4000, 16 CPU threads | CUDA | ~18.5 tok/s |
-| 9B Q4_K_M | Quadro P4000, 16 CPU threads | CUDA | ~16.3 tok/s |
 | 9B Q6_K | Quadro P4000 | CPU (CUDA off) | slower |
+
+Smaller quantizations are faster (fewer bytes per token) and use less VRAM: the
+9B Q4_K_M fits in about 6 GB where Q6_K needs closer to 8 GB.
 
 Speed depends on the model and the memory bandwidth of your GPU. A rough rule:
 output speed is bounded by reading the model's weights once per token, so
