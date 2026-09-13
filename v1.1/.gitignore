@@ -1,0 +1,11 @@
+.tools/
+reference/
+build*/
+models/
+.venv/
+__pycache__/
+*.partial
+results/
+local-settings.json
+*.gguf
+*.safetensors
